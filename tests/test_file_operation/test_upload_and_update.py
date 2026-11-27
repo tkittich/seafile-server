@@ -748,3 +748,58 @@ def test_resumable_upload_offset_invalid(repo, is_ajax):
     time.sleep(1)
     del_repo_files(repo.id)
     del_local_files()
+
+
+def _require_go_fileserver_preconditions():
+    resp = requests.options('http://127.0.0.1:8082/upload-aj/precondition-probe')
+    allow_headers = resp.headers.get('Access-Control-Allow-Headers', '').lower()
+    if 'if-none-match' not in allow_headers:
+        pytest.skip('If-None-Match requires Go fileserver (use_go_fileserver = true)')
+
+
+def _upload(url, name, content, headers=None, **fields):
+    form = {'parent_dir': '/', 'file': (name, content, 'text/plain')}
+    form.update(fields)
+    m = MultipartEncoder(fields=form)
+    h = {'Content-Type': m.content_type}
+    h.update(headers or {})
+    return requests.post(url, headers=h, data=m, params={'ret-json': '1'})
+
+
+def test_upload_if_none_match(repo):
+    _require_go_fileserver_preconditions()
+
+    obj_id = '{"parent_dir":"/"}'
+    token = api.get_fileserver_access_token(repo.id, obj_id, 'upload', USER, False)
+    url = 'http://127.0.0.1:8082/upload-api/' + token
+    inm = {'If-None-Match': '*'}
+
+    # Free name: created. Same name again: 412 even with replace=1, content untouched.
+    r = _upload(url, 'cond.txt', b'v1', inm)
+    assert r.status_code == 200
+    assert r.json()[0]['name'] == 'cond.txt'
+    assert _upload(url, 'cond.txt', b'v2', inm).status_code == 412
+    assert _upload(url, 'cond.txt', b'v2', inm, replace='1').status_code == 412
+
+    # An existing directory counts as taken.
+    assert _upload(url, 'dir1', b'x', inm).status_code == 412
+
+    # relative_path: first upload creates it, the repeat is 412.
+    assert _upload(url, 'rel.txt', b'x', inm, relative_path='newsub').status_code == 200
+    assert _upload(url, 'rel.txt', b'x', inm, relative_path='newsub').status_code == 412
+
+    # Without the header nothing changes: replace=0 still creates "cond (1).txt".
+    r = _upload(url, 'cond.txt', b'v3')
+    assert r.status_code == 200
+    assert r.json()[0]['name'] == 'cond (1).txt'
+
+    # Unsupported conditions are rejected, not ignored.
+    assert _upload(url, 'other.txt', b'x', {'If-Match': '*'}).status_code == 400
+    assert _upload(url, 'other.txt', b'x', {'If-None-Match': '"abc"'}).status_code == 400
+    assert _upload(url, 'other.txt', b'x', {'If-Match': '*', 'If-None-Match': '*'}).status_code == 400
+
+    update_token = api.get_fileserver_access_token(repo.id, obj_id, 'update', USER, False)
+    m = MultipartEncoder(fields={'target_file': '/cond.txt', 'file': ('cond.txt', b'v4', 'text/plain')})
+    r = requests.post('http://127.0.0.1:8082/update-api/' + update_token,
+                      headers={'Content-Type': m.content_type, 'If-None-Match': '*'}, data=m)
+    assert r.status_code == 400

@@ -1213,7 +1213,7 @@ func uploadAPICB(rsp http.ResponseWriter, r *http.Request) *appError {
 
 func setAccessControl(rsp http.ResponseWriter) {
 	rsp.Header().Set("Access-Control-Allow-Origin", "*")
-	rsp.Header().Set("Access-Control-Allow-Headers", "x-requested-with, content-type, content-range, content-disposition, accept, origin, authorization")
+	rsp.Header().Set("Access-Control-Allow-Headers", "x-requested-with, content-type, content-range, content-disposition, accept, origin, authorization, if-none-match")
 	rsp.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	rsp.Header().Set("Access-Control-Max-Age", "86400")
 }
@@ -1258,6 +1258,11 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		return &appError{nil, "", http.StatusBadRequest}
 	}
 	defer r.MultipartForm.RemoveAll()
+
+	pre, appErr := parseUploadPrecondition(r)
+	if appErr != nil {
+		return appErr
+	}
 
 	repoID := fsm.repoID
 	user := fsm.user
@@ -1308,6 +1313,13 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		if len(files) > 1 {
 			msg := "More files in one request"
 			return &appError{nil, msg, http.StatusBadRequest}
+		}
+
+		if fsm.rstart == 0 && pre.active() && len(files) == 1 {
+			chunkFileName := normalizeUTF8Path(filepath.Base(files[0].Filename))
+			if appErr := checkUploadPreconditionAtHead(repoID, newParentDir, []string{chunkFileName}, pre); appErr != nil {
+				return appErr
+			}
 		}
 
 		if appErr := writeBlockDataToTmpFile(r, fsm, formFiles, repoID, newParentDir); appErr != nil {
@@ -1401,12 +1413,18 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		return &appError{nil, msg, seafHTTPResNoQuota}
 	}
 
+	if pre.active() {
+		if appErr := checkUploadPreconditionAtHead(repoID, newParentDir, fsm.fileNames, pre); appErr != nil {
+			return appErr
+		}
+	}
+
 	if err := createRelativePath(repoID, parentDir, relativePath, user); err != nil {
 		return err
 	}
 
 	if err := postMultiFiles(rsp, r, repoID, newParentDir, user, fsm,
-		replaceExisted, mtimes, isAjax); err != nil {
+		replaceExisted, mtimes, isAjax, pre); err != nil {
 		return err
 	}
 
@@ -1857,7 +1875,7 @@ func checkFileSizeByContentLength(r *http.Request, contentLen int64) *appError {
 	return nil
 }
 
-func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user string, fsm *recvData, replace bool, mtimes []int64, isAjax bool) *appError {
+func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user string, fsm *recvData, replace bool, mtimes []int64, isAjax bool, pre uploadPrecondition) *appError {
 
 	fileNames := fsm.fileNames
 	files := fsm.files
@@ -1870,7 +1888,7 @@ func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir,
 
 	canonPath := getCanonPath(parentDir)
 
-	if !replace && checkFilesWithSameName(repo, canonPath, fileNames) {
+	if !replace && !pre.active() && checkFilesWithSameName(repo, canonPath, fileNames) {
 		msg := "Too many files with same name.\n"
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
@@ -1931,8 +1949,14 @@ func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir,
 		}
 	}
 
-	retStr, err := postFilesAndGenCommit(fileNames, repo.ID, user, canonPath, replace, ids, sizes, mtimes, gcID)
+	retStr, err := postFilesAndGenCommit(r.Context(), fileNames, repo.ID, user, canonPath, replace, ids, sizes, mtimes, gcID, pre)
 	if err != nil {
+		if errors.Is(err, ErrPreconditionFailed) {
+			return &appError{nil, "Precondition failed", http.StatusPreconditionFailed}
+		}
+		if errors.Is(err, ErrTooManyRetries) {
+			return &appError{nil, "Too many concurrent updates, please retry", http.StatusServiceUnavailable}
+		}
 		if errors.Is(err, ErrGCConflict) {
 			return &appError{nil, "GC Conflict.\n", http.StatusConflict}
 		} else {
@@ -1991,9 +2015,106 @@ func checkFilesWithSameName(repo *repomgr.Repo, canonPath string, fileNames []st
 	return false
 }
 
-func postFilesAndGenCommit(fileNames []string, repoID string, user, canonPath string, replace bool, ids []string, sizes []int64, mtimes []int64, lastGCID string) (string, error) {
+const maxPreconditionRetries = 10
+
+var (
+	ErrPreconditionFailed = errors.New("precondition failed")
+	ErrTooManyRetries     = errors.New("too many concurrent updates")
+)
+
+type uploadPrecondition struct {
+	ifNoneMatch bool
+}
+
+func (p uploadPrecondition) active() bool {
+	return p.ifNoneMatch
+}
+
+// parseUploadPrecondition reads the optional "If-None-Match: *" header.
+// Any other precondition header is rejected instead of silently ignored.
+func parseUploadPrecondition(r *http.Request) (uploadPrecondition, *appError) {
+	if len(r.Header.Values("If-Match")) > 0 {
+		return uploadPrecondition{}, &appError{nil, "If-Match is not supported", http.StatusBadRequest}
+	}
+	vals := r.Header.Values("If-None-Match")
+	if len(vals) == 0 {
+		return uploadPrecondition{}, nil
+	}
+	if strings.TrimSpace(strings.Join(vals, ",")) != "*" {
+		return uploadPrecondition{}, &appError{nil, "If-None-Match only supports *", http.StatusBadRequest}
+	}
+	return uploadPrecondition{ifNoneMatch: true}, nil
+}
+
+// rejectPreconditionHeaders returns 400 if the request carries a precondition
+// header, for endpoints that do not support them.
+func rejectPreconditionHeaders(r *http.Request, msg string) *appError {
+	pre, appErr := parseUploadPrecondition(r)
+	if appErr != nil {
+		return appErr
+	}
+	if pre.active() {
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	return nil
+}
+
+func getDirForPrecondition(storeID, rootID, canonPath string) (*fsmgr.SeafDir, error) {
+	dir, err := fsmgr.GetSeafdirByPath(storeID, rootID, canonPath)
+	if err != nil {
+		if errors.Is(err, fsmgr.ErrPathNoExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return dir, nil
+}
+
+func checkUploadPreconditionAtHead(repoID, parentDir string, fileNames []string, pre uploadPrecondition) *appError {
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		err := fmt.Errorf("failed to get repo %s", repoID)
+		return &appError{err, "Failed to get repo.\n", http.StatusInternalServerError}
+	}
+	headCommit, err := commitmgr.Load(repo.ID, repo.HeadCommitID)
+	if err != nil {
+		err := fmt.Errorf("failed to get head commit for repo %s: %v", repo.ID, err)
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+	dir, err := getDirForPrecondition(repo.StoreID, headCommit.RootID, getCanonPath(parentDir))
+	if err != nil {
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+	if err := checkPreconditionAgainstDir(dir, fileNames, pre); err != nil {
+		return &appError{nil, "Precondition failed", http.StatusPreconditionFailed}
+	}
+	return nil
+}
+
+// checkPreconditionAgainstDir returns ErrPreconditionFailed if any of fileNames
+// already exists in dir (as a file or a directory) or appears twice in the request.
+func checkPreconditionAgainstDir(dir *fsmgr.SeafDir, fileNames []string, pre uploadPrecondition) error {
+	if !pre.active() {
+		return nil
+	}
+	taken := make(map[string]struct{}, len(fileNames))
+	if dir != nil {
+		for _, de := range dir.Entries {
+			taken[de.Name] = struct{}{}
+		}
+	}
+	for _, name := range fileNames {
+		if _, exists := taken[name]; exists {
+			return ErrPreconditionFailed
+		}
+		taken[name] = struct{}{}
+	}
+	return nil
+}
+
+func postFilesAndGenCommit(ctx context.Context, fileNames []string, repoID string, user, canonPath string, replace bool, ids []string, sizes []int64, mtimes []int64, lastGCID string, pre uploadPrecondition) (string, error) {
 	handleConncurrentUpdate := true
-	if !replace {
+	if !replace || pre.active() {
 		handleConncurrentUpdate = false
 	}
 	repo := repomgr.Get(repoID)
@@ -2024,6 +2145,17 @@ func postFilesAndGenCommit(fileNames []string, repoID string, user, canonPath st
 	}
 
 retry:
+	if pre.active() {
+		dir, err := getDirForPrecondition(repo.StoreID, headCommit.RootID, canonPath)
+		if err != nil {
+			return "", err
+		}
+		if err := checkPreconditionAgainstDir(dir, fileNames, pre); err != nil {
+			return "", err
+		}
+		names = nil
+	}
+
 	rootID, err := doPostMultiFiles(repo, headCommit.RootID, canonPath, dents, user, replace, &names)
 	if err != nil {
 		err := fmt.Errorf("failed to post files to %s in repo %s", canonPath, repo.ID)
@@ -2044,10 +2176,22 @@ retry:
 			return "", err
 		}
 		retryCnt++
+		if pre.active() && retryCnt >= maxPreconditionRetries {
+			return "", ErrTooManyRetries
+		}
 		/* Sleep random time between 0 and 3 seconds. */
 		random := rand.Intn(30) + 1
 		log.Debugf("concurrent upload retry :%d", retryCnt)
-		time.Sleep(time.Duration(random*100) * time.Millisecond)
+		sleepDur := time.Duration(random*100) * time.Millisecond
+		if pre.active() {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(sleepDur):
+			}
+		} else {
+			time.Sleep(sleepDur)
+		}
 		repo = repomgr.Get(repoID)
 		if repo == nil {
 			err := fmt.Errorf("failed to get repo %s", repoID)
@@ -3260,6 +3404,10 @@ func doUpdate(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 	}
 	defer r.MultipartForm.RemoveAll()
 
+	if appErr := rejectPreconditionHeaders(r, "Preconditions are not supported on update"); appErr != nil {
+		return appErr
+	}
+
 	repoID := fsm.repoID
 	user := fsm.user
 
@@ -3587,6 +3735,10 @@ func doUploadBlks(rsp http.ResponseWriter, r *http.Request, fsm *recvData) *appE
 	}
 	defer r.MultipartForm.RemoveAll()
 
+	if appErr := rejectPreconditionHeaders(r, "Preconditions are not supported on block uploads"); appErr != nil {
+		return appErr
+	}
+
 	repoID := fsm.repoID
 	user := fsm.user
 
@@ -3836,6 +3988,10 @@ func doUploadRawBlks(rsp http.ResponseWriter, r *http.Request, fsm *recvData) *a
 		return &appError{nil, "", http.StatusBadRequest}
 	}
 	defer r.MultipartForm.RemoveAll()
+
+	if appErr := rejectPreconditionHeaders(r, "Preconditions are not supported on block uploads"); appErr != nil {
+		return appErr
+	}
 
 	repoID := fsm.repoID
 	user := fsm.user
